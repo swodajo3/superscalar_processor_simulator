@@ -34,6 +34,7 @@ struct schedule_queue {
     int src_reg2_tag;
     int src_reg2_value;
     int busy;
+    int inst_id;
 };
 
 struct register_file {
@@ -44,18 +45,23 @@ struct register_file {
 
 struct scoreboard {
     struct func_unit* fu[3];
-    int* num_fus;
+    int num_fus[3];
 };
 
 struct func_unit {
     int busy;
     int life;
+    int inst_id;
+    int reg;
+    int tag;
+    int value;
 };
 
 struct common_data_bus {
     int tag;
     int value;
     int reg;
+    int busy;
 };
 
 void init_proc();
@@ -66,6 +72,9 @@ void dispatch(int cycle_half);
 void run_proc();
 void clear_not_ready_buf();
 void schedule(int cycle_half);
+void execute(int cycle_half);
+void update_reg_file(int cycle_half);
+void update_fu_status(int k, int type);
 
 int R;
 int F;
@@ -86,8 +95,10 @@ struct dispatch_queue* disp_q;
 struct schedule_queue* sched_q;
 int* free_list;
 int* not_ready_regs;
+int* inst_retire_list;
 struct register_file* registers;
 int next_tag;
+int next_inst_id;
 struct scoreboard* scoreboard;
 struct common_data_bus* CDB;
 
@@ -103,6 +114,7 @@ int main(int argc, char *argv[]) {
     //FILE* fp  = stdin;
     int opt;
     char *fileN;
+    fp = fopen("hmmer.100k.trace", "r");
 
 	while(-1 != (opt = getopt(argc, argv, "r:f:j:k:l:t"))) {
         
@@ -140,19 +152,26 @@ void run_proc() {
         for (int cycle_half = 1; cycle_half < 3; cycle_half++) {
             dispatch(cycle_half);
             schedule(cycle_half);
+            execute(cycle_half);
+            update_reg_file(cycle_half);
         }
-        
     }
 }
 
 void init_proc() {
     SCHED_Q_SIZE = 2 * (K0 + K1 + K2); 
     next_tag = 0;
+    next_inst_id = 0;
     if ((disp_q = calloc(1, sizeof(struct dispatch_queue))) == NULL) {
         perror("calloc");
         exit(EXIT_FAILURE);
     }
     if ((sched_q = calloc(SCHED_Q_SIZE, sizeof(struct schedule_queue))) == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+
+    if ((inst_retire_list = calloc(SCHED_Q_SIZE, sizeof(int))) == NULL) {
         perror("calloc");
         exit(EXIT_FAILURE);
     }
@@ -243,7 +262,7 @@ void fetch_instructions() {
     int dest_reg;
     int src_reg1;
     int src_reg2;
-    while (inst_count < F) {
+    while (inst_count < F && !feof(fp)) {
         int ret = fscanf(fp, "%" PRIx64 " %d %d %d %d \n", &address, &op_type, &dest_reg, &src_reg1, &src_reg2);
         if(ret == 5) {
             struct instruction* inst = create_inst(op_type, dest_reg, src_reg1, src_reg2);
@@ -264,6 +283,7 @@ void dispatch(int cycle_half) {
 
                 sched_q[i].fu = disp_entry->inst->op_type;
                 sched_q[i].dest_reg = disp_entry->inst->dest;
+                //sched_q[i].inst_id = next_inst_id++;
 
                 if (registers[disp_entry->inst->src1].ready) {
                     sched_q[i].src_reg1_value = registers[disp_entry->inst->src1].value;
@@ -280,9 +300,13 @@ void dispatch(int cycle_half) {
                     sched_q[i].src_reg2_tag = registers[disp_entry->inst->src2].tag;
                     sched_q[i].src_reg2_ready = 0;
                 }
-                registers[disp_entry->inst->dest].tag = next_tag; 
-                sched_q[i].dest_reg_tag = next_tag++;
-                not_ready_regs[disp_entry->inst->dest] = 1;
+
+                if (disp_entry->inst->dest > 0) {
+                    registers[disp_entry->inst->dest].tag = next_tag; 
+                    sched_q[i].dest_reg_tag = next_tag++;
+                    not_ready_regs[disp_entry->inst->dest] = 1;
+                }
+                
             } 
             
             free_list[i] = sched_q[i].busy;
@@ -307,14 +331,19 @@ void schedule(int cycle_half) {
     for (int i = 0; i < SCHED_Q_SIZE; i++) {
         if (cycle_half == 1) {
             //TODO: fired in order of increasing tag values
-            if (sched_q[i].src_reg1_ready && sched_q[i].src_reg2_ready) {
+            if (sched_q[i].src_reg1_ready && sched_q[i].src_reg2_ready && sched_q[i].fu > 0) {
                 for (int j = 0; j < scoreboard->num_fus[sched_q[i].fu]; j++) {
-                    if (scoreboard->fu[sched_q[i].fu][j].busy == 1) {
-                        scoreboard->fu[sched_q[i].fu][j].busy = 0; // not busy
+                    if (scoreboard->fu[sched_q[i].fu][j].busy == 0) {
+                        scoreboard->fu[sched_q[i].fu][j].busy = 1; 
                         scoreboard->fu[sched_q[i].fu][j].life = 0;
+                        scoreboard->fu[sched_q[i].fu][j].inst_id = i;
+                        scoreboard->fu[sched_q[i].fu][j].reg = sched_q[i].dest_reg;
+                        scoreboard->fu[sched_q[i].fu][j].tag = sched_q[i].dest_reg_tag;
                         break;
                     }
                 }
+            } else if (sched_q[i].src_reg1_ready && sched_q[i].src_reg2_ready && sched_q[i].fu < 0) {
+                sched_q[i].busy = 0;
             }
         } else {
             for (int j = 0; j < R; j++) {
@@ -332,12 +361,46 @@ void schedule(int cycle_half) {
 }
 
 void execute(int cycle_half) {
-    for (int i = 0; i < K0; i++) {
-        if (scoreboard->fu[0][i].busy && !scoreboard->fu[0][i].life) {
-            scoreboard->fu[0][i].life++;
-        } else if (scoreboard->fu[0][i].busy && scoreboard->fu[0][i].life) {
-            scoreboard->fu[0][i].life = 0;
-            scoreboard->fu[0][i].busy = 0;
+    if (cycle_half == 2) {
+        update_fu_status(K0, 0);
+        update_fu_status(K1, 1);
+        update_fu_status(K2, 2);
+    }
+}
+
+void update_fu_status(int k, int type) {
+    for (int i = 0; i < k; i++) {
+        if (scoreboard->fu[type][i].busy && !scoreboard->fu[type][i].life) {
+            scoreboard->fu[type][i].life++;
+        } else if (scoreboard->fu[type][i].busy && scoreboard->fu[type][i].life) {
+            for (int j = 0; j < R; j++) {
+                if (!CDB[j].busy) {
+                    CDB[j].busy = 1;
+                    CDB[j].tag = scoreboard->fu[type][i].tag;
+                    CDB[j].value = scoreboard->fu[type][i].value;
+                    CDB[j].reg = scoreboard->fu[type][i].reg;
+                    scoreboard->fu[type][i].life = 0;
+                    scoreboard->fu[type][i].busy = 0;
+                    sched_q[scoreboard->fu[type][i].inst_id].busy = 0;
+                    break;
+                }
+            }
         }
     }
 }
+
+void update_reg_file(int cycle_half) {
+    if (cycle_half == 1) {
+        for (int j = 0; j < R; j++) {
+            if (CDB[j].busy && CDB[j].tag == registers[CDB[j].reg].tag) {
+                registers[CDB[j].reg].ready = 1; 
+                registers[CDB[j].reg].value = CDB[j].value;
+                CDB[j].busy = 0;
+            }
+        } 
+    }
+
+}
+
+
+
