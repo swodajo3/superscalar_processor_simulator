@@ -86,7 +86,7 @@ typedef struct _proc_stats_t
         float avg_inst_retired;
         float avg_inst_Issue;
         float avg_disp_size;
-        unsigned long max_disp_size;
+        int max_disp_size;
         unsigned long cycle_count;
 } proc_stats_t;
 
@@ -95,15 +95,20 @@ void init_proc();
 struct instruction* create_inst(uint64_t address, int op_type, int dest_reg, int src_reg1, int src_reg2);
 void add_to_disp_q(struct instruction* inst);
 void fetch_instructions();
-void dispatch(int cycle_half);
+void dispatch();
 void run_proc();
 void clear_not_ready_buf();
 void schedule(int cycle_half);
-void execute(int cycle_half);
-void update_reg_file(int cycle_half);
+void scheduler_to_fu();
+void execute();
+void update_reg_file();
 void update_fu_status(int k, int type);
 void fetch_to_disp_trans();
 int get_next_fired();
+void print_instruction(struct instruction* inst);
+void scheduler_update();
+void print_statistics();
+void write_inst_stat(struct instruction* inst);
 
 int R;
 int F;
@@ -145,11 +150,10 @@ int main(int argc, char *argv[]) {
     K1 = DEFAULT_K1;
     K2 = DEFAULT_K2;
 
-    //FILE* fp  = stdin;
+    fp  = stdin;
     int opt;
-    char *fileN;
-    fp = fopen("hmmer.100k.trace", "r");
-    fp_write = fopen("hmmer.100k.output", "w");
+
+    fp_write = fopen("output.txt", "w");
 
 	while(-1 != (opt = getopt(argc, argv, "r:f:j:k:l:t"))) {
         
@@ -170,7 +174,7 @@ int main(int argc, char *argv[]) {
             K2 = atoi(optarg);
             break;
         case 't':
-            fp = fopen("hmmer.100k.trace", "r");
+            fp = fopen(optarg, "r");
             break;
         }
     } 
@@ -181,26 +185,6 @@ int main(int argc, char *argv[]) {
     run_proc();
     fclose(fp);
     fclose(fp_write);
-}
-
-void print_proc_settings() {
-    fprintf(fp_write, "Processor Settings:\nR: %d\nk0: %d\nk1: %d\nk2: %d\nF: : %d\n", 
-       R, K0, K1, K2, F);
-    fprintf(fp_write, "INST\tFETCH\tDISP\tSCHED\tEXEC\tSTATE\n");
-}
-
-void run_proc() {
-    while (!feof(fp) /*|| sched_q_size > 0 || disp_q->size > 0*/) {
-        cycle_count++;
-        // for (int cycle_half = 1; cycle_half < 3; cycle_half++) {
-        //     update_reg_file(cycle_half);
-        //     execute(cycle_half);
-        //     schedule(cycle_half);
-        //     dispatch(cycle_half);
-        // }
-        fetch_to_disp_trans();
-        fetch_instructions();
-    }
 }
 
 void init_proc() {
@@ -269,6 +253,177 @@ void init_proc() {
         perror("calloc");
         exit(EXIT_FAILURE);
     }
+    if ((p_stats = calloc(1, sizeof(proc_stats_t))) == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void print_proc_settings() {
+    fprintf(fp_write, "Processor Settings:\nR: %d\nk0: %d\nk1: %d\nk2: %d\nF: : %d\n", 
+       R, K0, K1, K2, F);
+    fprintf(fp_write, "INST\tFETCH\tDISP\tSCHED\tEXEC\tSTATE\n");
+}
+
+void run_proc() {
+    while (!feof(fp) || sched_q_size > 0 || disp_q->size > 0) {
+        //printf("sched_q_size = %d, disp_q_size = %d\n", sched_q_size, disp_q->size);
+        cycle_count++;
+        execute();
+        update_reg_file();
+        scheduler_to_fu();
+        dispatch();
+        scheduler_update();
+        fetch_to_disp_trans();
+        fetch_instructions();
+    }
+    print_statistics();
+}
+
+void execute() {
+    update_fu_status(K0, 0);
+    update_fu_status(K1, 1);
+    update_fu_status(K2, 2);
+}
+
+void update_fu_status(int k, int type) {
+    for (int i = 0; i < k; i++) {
+        if (scoreboard->fu[type][i].busy && !scoreboard->fu[type][i].life) {
+            scoreboard->fu[type][i].life++;
+        } else if (scoreboard->fu[type][i].busy && scoreboard->fu[type][i].life) {
+            for (int j = 0; j < R; j++) {
+                if (!CDB[j].busy) {
+                    CDB[j].busy = 1;
+                    CDB[j].tag = scoreboard->fu[type][i].tag;
+                    CDB[j].value = scoreboard->fu[type][i].value;
+                    CDB[j].reg = scoreboard->fu[type][i].reg;
+                    scoreboard->fu[type][i].life = 0;
+                    scoreboard->fu[type][i].busy = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void update_reg_file() {
+    for (int j = 0; j < R; j++) {
+        if (CDB[j].busy && CDB[j].tag == registers[CDB[j].reg].tag) {
+            registers[CDB[j].reg].ready = 1; 
+            registers[CDB[j].reg].value = CDB[j].value;
+        }
+    } 
+}
+
+void scheduler_to_fu() {
+    int fire_offset = get_next_fired();
+    //get_next_fired(&fire_offset);
+   
+    while (fire_offset >= 0) {
+        printf("scheduler to fu = %d \n", fire_offset);
+        int fu_type = sched_q[fire_offset].fu;
+        if (fu_type < 0) {
+            fu_type = 1;
+        } 
+        for (int j = 0; j < scoreboard->num_fus[fu_type]; j++) {
+
+            if (!scoreboard->fu[fu_type][j].busy) {
+                scoreboard->fu[fu_type][j].busy = 1; 
+                scoreboard->fu[fu_type][j].life = 0;
+                scoreboard->fu[fu_type][j].inst_id = fire_offset;
+                scoreboard->fu[fu_type][j].reg = sched_q[fire_offset].dest_reg;
+                int tag = sched_q[fire_offset].dest_reg_tag;
+                scoreboard->fu[fu_type][j].tag = tag;
+                sched_q[fire_offset].inst->status->exec_cycle = cycle_count;
+                break;
+            }
+        }
+        fire_offset = get_next_fired();
+    } 
+}
+
+int get_next_fired() {
+    int min_tag = next_tag;
+    int min_offset = -1;
+    for (int i = 0; i < SCHED_Q_SIZE; i++) {
+        if (sched_q[i].busy
+            && !sched_q[i].inst->status->exec_cycle
+            && sched_q[i].src_reg1_ready 
+            && sched_q[i].src_reg2_ready 
+            && sched_q[i].dest_reg_tag <= min_tag) {
+
+            min_tag = sched_q[i].dest_reg_tag;
+            min_offset = i;
+        }
+    }
+    //*min = min_offset;
+    return min_offset;
+}
+
+void dispatch() {
+    for(int i = 0; i < SCHED_Q_SIZE; i++) {
+        if(!sched_q[i].busy && disp_q->size) {
+            struct dispatch_entry* disp_entry = disp_q->head;
+            disp_q->head = disp_q->head->next;
+            disp_q->size--;
+            sched_q_size++;
+            sched_q[i].fu = disp_entry->inst->op_type; //dont' need this
+            sched_q[i].dest_reg = disp_entry->inst->dest; //dont' need this
+            disp_entry->inst->status->sched_cycle = cycle_count;
+            sched_q[i].inst = disp_entry->inst;
+            assert(sched_q[i].inst != NULL);
+            sched_q[i].busy = 1;
+            if (sched_q[i].inst->src1 < 1) {
+                sched_q[i].src_reg1_ready = 1;
+            } else if (registers[sched_q[i].inst->src1].ready) {
+                sched_q[i].src_reg1_value = registers[sched_q[i].inst->src1].value;
+                sched_q[i].src_reg1_ready = 1;
+            } else {
+                sched_q[i].src_reg1_tag = registers[sched_q[i].inst->src1].tag;
+                sched_q[i].src_reg1_ready = 0;
+            }
+
+            if (sched_q[i].inst->src2 < 1) {
+                sched_q[i].src_reg2_ready = 1;
+            } else if (registers[sched_q[i].inst->src2].ready) {
+                sched_q[i].src_reg2_value = registers[sched_q[i].inst->src2].value;
+                sched_q[i].src_reg2_ready = 1;
+            } else {
+                sched_q[i].src_reg2_tag = registers[sched_q[i].inst->src2].tag;
+                sched_q[i].src_reg2_ready = 0;
+            }
+
+            if (sched_q[i].inst->dest > 0) {
+                registers[sched_q[i].inst->dest].tag = next_tag; 
+                sched_q[i].dest_reg_tag = next_tag++;
+                registers[sched_q[i].inst->dest].ready = 0;   
+            }    
+        }
+    }
+}
+
+void scheduler_update() {
+    for (int i = 0; i < SCHED_Q_SIZE; i++) {
+        for (int j = 0; j < R; j++) {
+            if (CDB[j].busy && CDB[j].tag == sched_q[i].src_reg1_tag && sched_q[i].busy) {
+                sched_q[i].src_reg1_ready = 1;
+                sched_q[i].src_reg1_value = CDB[j].value;
+            } 
+            if (CDB[j].busy && CDB[j].tag == sched_q[i].src_reg2_tag && sched_q[i].busy) {
+                sched_q[i].src_reg2_ready = 1;
+                sched_q[i].src_reg2_value = CDB[j].value;
+            }
+            if (CDB[j].busy && CDB[j].tag == sched_q[i].dest_reg && sched_q[i].busy) {
+                CDB[j].busy = 0;
+                sched_q[i].busy = 0;
+                sched_q[i].inst->status->exec_cycle = cycle_count;
+                sched_q_size--;
+                p_stats->retired_instruction++;
+                write_inst_stat(sched_q[i].inst);
+            }
+        }
+    }
+ 
 }
 
 void fetch_instructions() {
@@ -280,6 +435,7 @@ void fetch_instructions() {
     int src_reg2;
     while (inst_count < F && !feof(fp)) {
         int ret = fscanf(fp, "%" PRIx64 " %d %d %d %d \n", &address, &op_type, &dest_reg, &src_reg1, &src_reg2);
+        
         if(ret == 5) {
             struct instruction* inst = create_inst(address, op_type, dest_reg, src_reg1, src_reg2);
             inst->status->fetch_cycle = cycle_count;
@@ -287,10 +443,10 @@ void fetch_instructions() {
             assert(inst != NULL);
             fetch_inst_size = inst_count + 1;
             //add_to_disp_q(inst);
-            //printf("read instruction %" PRIx64 "%d %d %d %d \n", address, op_type, dest_reg, src_reg1, src_reg2);
         }
         inst_count++;
     }
+
 }
 
 struct instruction* create_inst(uint64_t address, int op_type, int dest_reg, int src_reg1, int src_reg2) {
@@ -307,9 +463,10 @@ struct instruction* create_inst(uint64_t address, int op_type, int dest_reg, int
 
 void fetch_to_disp_trans() {
     for (int i = 0; i < fetch_inst_size; i++) {
-        assert(fetch_to_disp_buf[i] != NULL);
         add_to_disp_q(fetch_to_disp_buf[i]);
-        printf("instruction id = %d\n", disp_q->head[next_inst_id].inst->inst_id);    
+    }
+    if (disp_q->size > p_stats->max_disp_size) {
+        p_stats->max_disp_size = disp_q->size;
     }
 }
 
@@ -334,182 +491,35 @@ void add_to_disp_q(struct instruction* inst) {
     entry->next = NULL;
 }
 
-
-void dispatch(int cycle_half) {
-    if (cycle_half == 1) {
-        for(int i = 0; i < SCHED_Q_SIZE; i++) {
-            if(!sched_q[i].busy && disp_q->size) {
-                struct dispatch_entry* disp_entry = disp_q->head;
-                disp_q->head = disp_q->head->next;
-                disp_q->size--;
-                sched_q_size++;
-                sched_q[i].fu = disp_entry->inst->op_type; //dont' need this
-                sched_q[i].dest_reg = disp_entry->inst->dest; //dont' need this
-                disp_entry->inst->status->sched_cycle = cycle_count;
-                sched_q[i].inst = disp_entry->inst;
-                sched_q[i].busy = 1;
-                reserved_list[i] = 1;
-            }
-        }
-
-    } else {
-        for (int i = 0; i < SCHED_Q_SIZE; i++) {
-            if (reserved_list[i]) {
-                if (sched_q[i].inst->src1 < 1) {
-                    sched_q[i].src_reg1_ready = 1;
-                } else if (registers[sched_q[i].inst->src1].ready) {
-                    sched_q[i].src_reg1_value = registers[sched_q[i].inst->src1].value;
-                    sched_q[i].src_reg1_ready = 1;
-                } else {
-                    sched_q[i].src_reg1_tag = registers[sched_q[i].inst->src1].tag;
-                    sched_q[i].src_reg1_ready = 0;
-                }
-
-                if (sched_q[i].inst->src2 < 1) {
-                    sched_q[i].src_reg2_ready = 1;
-                } else if (registers[sched_q[i].inst->src2].ready) {
-                    sched_q[i].src_reg2_value = registers[sched_q[i].inst->src2].value;
-                    sched_q[i].src_reg2_ready = 1;
-                } else {
-                    sched_q[i].src_reg2_tag = registers[sched_q[i].inst->src2].tag;
-                    sched_q[i].src_reg2_ready = 0;
-                }
-
-                if (sched_q[i].inst->dest > 0) {
-                    registers[sched_q[i].inst->dest].tag = next_tag; 
-                    sched_q[i].dest_reg_tag = next_tag++;
-                    registers[sched_q[i].inst->dest].ready = 0;
-                    
-                }
-                reserved_list[i] = 0;
-            }
-        }
-    }
+void print_instruction(struct instruction* inst) {
+    printf("instID = %d, op = %d, dest = %d, src1 = %d, src2 = %d\n", 
+        inst->inst_id, inst->op_type, inst->dest, inst->src1, inst->src2);
 }
 
-void schedule(int cycle_half) {
-    if (cycle_half == 1) {
-        int fire_offset = get_next_fired();
-       
-        while (fire_offset > 0) {
-            int fu_type = sched_q[fire_offset].fu;
-            if (fu_type < 0) {
-                fu_type = 1;
-            } 
-            for (int j = 0; j < scoreboard->num_fus[fu_type]; j++) {
-                if (fire_offset) {
-                    scoreboard->fu[fu_type][j].busy = 1; 
-                    scoreboard->fu[fu_type][j].life = 0;
-                    scoreboard->fu[fu_type][j].inst_id = fire_offset;
-                    scoreboard->fu[fu_type][j].reg = sched_q[fire_offset].dest_reg;
-                    int tag = sched_q[fire_offset].dest_reg_tag;
-                    scoreboard->fu[fu_type][j].tag = tag;
-                    sched_q[fire_offset].inst->status->exec_cycle = cycle_count;
-                    break;
-                }
-            }
-            fire_offset = get_next_fired();
-        } 
-    } else {
-        for (int i = 0; i < SCHED_Q_SIZE; i++) {
-            for (int j = 0; j < R; j++) {
-                if (CDB[j].tag == sched_q[i].src_reg1_tag) {
-                    sched_q[i].src_reg1_ready = 1;
-                    sched_q[i].src_reg1_value = CDB[j].value;
-                } 
-                if (CDB[j].tag == sched_q[i].src_reg2_tag) {
-                    sched_q[i].src_reg2_ready = 1;
-                    sched_q[i].src_reg2_value = CDB[j].value;
-                }
-            }
-        }
-    }   
-}
+void print_statistics() {
+    p_stats->cycle_count = cycle_count;
+    p_stats->avg_disp_size = (double) p_stats->total_disp_size / p_stats->cycle_count;
+    p_stats->avg_inst_retired = (double) p_stats->retired_instruction / p_stats->cycle_count;
+    p_stats->avg_inst_Issue = (double) p_stats->Issue_instruction / p_stats->cycle_count;
 
-void execute(int cycle_half) {
-    if (cycle_half == 2) {
-        update_fu_status(K0, 0);
-        update_fu_status(K1, 1);
-        update_fu_status(K2, 2);
-    }
-}
-
-void update_fu_status(int k, int type) {
-    for (int i = 0; i < k; i++) {
-        if (scoreboard->fu[type][i].busy && !scoreboard->fu[type][i].life) {
-            scoreboard->fu[type][i].life++;
-        } else if (scoreboard->fu[type][i].busy && scoreboard->fu[type][i].life) {
-            for (int j = 0; j < R; j++) {
-                if (!CDB[j].busy) {
-                    CDB[j].busy = 1;
-                    CDB[j].tag = scoreboard->fu[type][i].tag;
-                    CDB[j].value = scoreboard->fu[type][i].value;
-                    CDB[j].reg = scoreboard->fu[type][i].reg;
-                    scoreboard->fu[type][i].life = 0;
-                    scoreboard->fu[type][i].busy = 0;
-                    sched_q_size--;
-                    sched_q[scoreboard->fu[type][i].inst_id].busy = 0;
-                    sched_q[scoreboard->fu[type][i].inst_id].inst->status->state_cycle = cycle_count;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-void update_reg_file(int cycle_half) {
-    if (cycle_half == 1) {
-        for (int j = 0; j < R; j++) {
-            if (CDB[j].busy && CDB[j].tag == registers[CDB[j].reg].tag) {
-                registers[CDB[j].reg].ready = 1; 
-                registers[CDB[j].reg].value = CDB[j].value;
-                CDB[j].busy = 0;
-            }
-        } 
-    }
-
-}
-
-int get_next_fired() {
-    int min_tag = next_tag;
-    int min_offset = -1;
-    for (int i = 0; i < SCHED_Q_SIZE; i++) {
-        if (sched_q[i].src_reg1_ready 
-            && sched_q[i].src_reg2_ready 
-            && sched_q[i].dest_reg_tag <= min_tag) {
-
-            min_tag = sched_q[i].dest_reg_tag;
-            min_offset = i;
-        }
-    }
-    return min_offset;
-}
-
-void print_statistics(proc_stats_t* p_stats, FILE* fp) {
-        fprintf(fp,"Processor stats:\n");
-        fprintf(fp,"Total instructions: %lu\n", p_stats->retired_instruction);
-        fprintf(fp,"Avg Dispatch queue size: %f\n", p_stats->avg_disp_size);
-        fprintf(fp,"Maximum Dispatch queue size: %lu\n", p_stats->max_disp_size);
-        fprintf(fp,"Avg inst Issue per cycle: %f\n", p_stats->avg_inst_Issue);
-        fprintf(fp,"Avg inst retired per cycle: %f\n", p_stats->avg_inst_retired);
-        fprintf(fp,"Total run time (cycles): %lu\n", p_stats->cycle_count);
+    fprintf(fp_write,"Processor stats:\n");
+    fprintf(fp_write,"Total instructions: %lu\n", p_stats->retired_instruction);
+    fprintf(fp_write,"Avg Dispatch queue size: %f\n", p_stats->avg_disp_size);
+    fprintf(fp_write,"Maximum Dispatch queue size: %d\n", p_stats->max_disp_size);
+    fprintf(fp_write,"Avg inst Issue per cycle: %f\n", p_stats->avg_inst_Issue);
+    fprintf(fp_write,"Avg inst retired per cycle: %f\n", p_stats->avg_inst_retired);
+    fprintf(fp_write,"Total run time (cycles): %lu\n", p_stats->cycle_count);
 } 
 
-// void complete_proc(proc_stats_t *p_stats, FILE* fp)
-// {
-//         p_stats->avg_disp_size = (double) p_stats->total_disp_size / p_stats->cycle_count;
-//         p_stats->avg_inst_retired = (double) p_stats->retired_instruction / p_stats->cycle_count;
-//         p_stats->avg_inst_Issue = (double) p_stats->Issue_instruction / p_stats->cycle_count;
+void write_inst_stat(struct instruction* inst) {
+    fprintf(fp_write, "%d\t%d\t%d\t%d\t%d\t",
+        inst->inst_id, 
+        inst->status->fetch_cycle,
+        inst->status->disp_cycle,
+        inst->status->exec_cycle,
+        inst->status->state_cycle);
+}
 
-//         fprintf(fp, "INST\tFETCH\tDISP\tSCHED\tEXEC\tSTATE\n");
-//         for (int i = 0; i != procSim.Statitics.size(); ++i) {
-//                 fprintf(fp, "%d\t", i + 1);
-//                 for (int j = 0; j != 5; ++j)
-//                         fprintf(fp, "%d\t", procSim.Statitics[i][j]);
-//                 fprintf(fp, "\n");
-//         }
-//         fprintf(fp, "\n");
-// }
 
 
 
